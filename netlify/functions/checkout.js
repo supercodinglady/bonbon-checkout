@@ -56,37 +56,4 @@ function redirect(location) {
   };
 }
 
-exports.handler = async (event) => {
-  const params = (event && event.queryStringParameters) || {};
-  const productsParam = (params.products || '').trim();
-
-  // No products: send the shopper to the shop instead of an empty cart.
-  if (!productsParam) {
-    return redirect(SHOP_FALLBACK_URL);
-  }
-
-  let adds = [];
-  try {
-    const map = await getVariantMap();
-    const chunks = productsParam.split(',');
-    for (const chunk of chunks) {
-      const parts = chunk.split(':');
-      const variantId = (parts[0] || '').trim();
-      const entry = map[variantId];
-      // Unknown variant or missing sku: skip it rather than breaking the redirect.
-      if (!entry || !entry.itemId || !entry.sku) continue;
-      const qty = Math.max(1, parseInt(parts[1], 10) || 1);
-      adds.push(entry.itemId + ':' + entry.sku + ':' + qty);
-    }
-  } catch (e) {
-    // Mapping failed (shop JSON unreachable): don't strand the shopper.
-    return redirect(SHOP_FALLBACK_URL);
-  }
-
-  if (adds.length === 0) {
-    return redirect(SHOP_FALLBACK_URL);
-  }
-
-  const target = CART_URL + '?add=' + encodeURIComponent(adds.join(','));
-  return redirect(target);
-};
+exports.handler = async (event) => { const params = (event && event.queryStringParameters) || {}; const productsParam = (params.products || '').trim(); let mapKeys = 0; let adds = []; let error = null; try { const map = await getVariantMap(); mapKeys = Object.keys(map).length; const chunks = productsParam.split(','); for (const chunk of chunks) { const parts = chunk.split(':'); const variantId = (parts[0] || '').trim(); const entry = map[variantId]; if (!entry || !entry.itemId || !entry.sku) continue; const qty = Math.max(1, parseInt(parts[1], 10) || 1); adds.push(entry.itemId + ':' + entry.sku + ':' + qty); } } catch (e) { error = String((e && e.message) || e); } return { statusCode: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }, body: JSON.stringify({ productsParam: productsParam, mapKeys: mapKeys, adds: adds, error: error }), }; };
