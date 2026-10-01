@@ -1,49 +1,92 @@
-// Bonbon Silver — Meta Shops checkout redirect.
-// Meta sends customers here like:
-//   /.netlify/functions/checkout?products=<retailer_id>:<qty>,...&coupon=<code>
-// This converts it to a Squarespace cart URL that pre-adds the item:
-//   https://www.bonbonsilver.com/cart?addProductId=<retailer_id>&quantity=<qty>
+// Netlify Function: Meta / Facebook Shop checkout redirect -> Squarespace cart
+//
+// Meta calls:
+//   /.netlify/functions/checkout?products=<variantId>:<qty>,<variantId>:<qty>&coupon=XXX
+//
+// We translate each Meta retailer_id (= Squarespace variant id) into the
+// {itemId, sku} pair that Squarespace's cart API needs, using the store's
+// public shop JSON, then redirect the shopper to:
+//
+//   https://www.bonbonsilver.com/cart?add=<itemId>:<sku>:<qty>,...
+//
+// A small footer script injected on bonbonsilver.com (Settings -> Advanced ->
+// Code Injection -> Footer) reads the ?add= parameter and POSTs each entry to
+// /api/commerce/shopping-cart/entries on the same origin (with CSRF crumb),
+// which is the only reliable way to build the shopper's cart.
 
-const SHOP = 'https://www.bonbonsilver.com';
+const SHOP_URL = 'https://www.bonbonsilver.com';
+const SHOP_JSON_URL = SHOP_URL + '/shop?format=json';
+const CART_URL = SHOP_URL + '/cart';
+const SHOP_FALLBACK_URL = SHOP_URL + '/shop';
+
+// variantId -> { itemId, sku }; refreshed every few minutes
+let variantCache = { at: 0, map: {} };
+const CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function getVariantMap() {
+  const now = Date.now();
+  if (Object.keys(variantCache.map).length > 0 && now - variantCache.at < CACHE_TTL_MS) {
+    return variantCache.map;
+  }
+  const res = await fetch(SHOP_JSON_URL, {
+    headers: { Accept: 'application/json', 'User-Agent': 'bonbon-checkout/1.0' },
+  });
+  if (!res.ok) throw new Error('shop JSON fetch failed: HTTP ' + res.status);
+  const data = await res.json();
+  const items = (data && data.collection && data.collection.items) || [];
+  const map = {};
+  for (const product of items) {
+    const itemId = product.id;
+    const variants = product.variants || [];
+    for (const v of variants) {
+      if (v && v.id && itemId) {
+        map[v.id] = { itemId: itemId, sku: v.sku || '' };
+      }
+    }
+  }
+  variantCache = { at: now, map: map };
+  return map;
+}
 
 function redirect(location) {
   return {
     statusCode: 302,
-    headers: { Location: location, 'Cache-Control': 'no-cache' },
+    headers: { Location: location, 'Cache-Control': 'no-store' },
+    body: '',
   };
 }
 
 exports.handler = async (event) => {
-  const params = event.queryStringParameters || {};
+  const params = (event && event.queryStringParameters) || {};
   const productsParam = (params.products || '').trim();
 
+  // No products: send the shopper to the shop instead of an empty cart.
   if (!productsParam) {
-    // No product info (e.g. Meta's URL check) -> send to the shop page.
-    return redirect(`${SHOP}/shop`);
+    return redirect(SHOP_FALLBACK_URL);
   }
 
-  const items = productsParam
-    .split(',')
-    .map((pair) => {
-      const idx = pair.lastIndexOf(':');
-      if (idx < 0) return null;
-      const id = pair.slice(0, idx).trim();
-      const qty = parseInt(pair.slice(idx + 1).trim(), 10);
-      if (!id) return null;
-      return { id, qty: Number.isFinite(qty) && qty > 0 ? qty : 1 };
-    })
-    .filter(Boolean);
-
-  if (items.length === 0) {
-    return redirect(`${SHOP}/shop`);
+  let adds = [];
+  try {
+    const map = await getVariantMap();
+    const chunks = productsParam.split(',');
+    for (const chunk of chunks) {
+      const parts = chunk.split(':');
+      const variantId = (parts[0] || '').trim();
+      const entry = map[variantId];
+      // Unknown variant or missing sku: skip it rather than breaking the redirect.
+      if (!entry || !entry.itemId || !entry.sku) continue;
+      const qty = Math.max(1, parseInt(parts[1], 10) || 1);
+      adds.push(entry.itemId + ':' + entry.sku + ':' + qty);
+    }
+  } catch (e) {
+    // Mapping failed (shop JSON unreachable): don't strand the shopper.
+    return redirect(SHOP_FALLBACK_URL);
   }
 
-  // Squarespace's cart accepts one addProductId; use the first item.
-  // (Antiques here are one-of-a-kind, so single-item checkout is the norm.)
-  const first = items[0];
-  const cartUrl =
-    `${SHOP}/cart?addProductId=${encodeURIComponent(first.id)}` +
-    `&quantity=${first.qty}`;
+  if (adds.length === 0) {
+    return redirect(SHOP_FALLBACK_URL);
+  }
 
-  return redirect(cartUrl);
+  const target = CART_URL + '?add=' + encodeURIComponent(adds.join(','));
+  return redirect(target);
 };
